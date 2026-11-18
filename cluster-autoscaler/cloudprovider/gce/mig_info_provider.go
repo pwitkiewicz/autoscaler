@@ -18,7 +18,9 @@ package gce
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"net/http"
 	"path"
 	"regexp"
 	"strings"
@@ -26,6 +28,7 @@ import (
 	"time"
 
 	gce "google.golang.org/api/compute/v1"
+	"google.golang.org/api/googleapi"
 	"k8s.io/client-go/util/workqueue"
 	"k8s.io/klog/v2"
 	"sigs.k8s.io/cluster-autoscaler/pkg/cloudprovider"
@@ -57,11 +60,11 @@ type MigInfoProvider interface {
 	// machine name. For standard types it's retrieved from GCE API.
 	GetMigMachineType(ctx context.Context, migRef GceRef) (MachineType, error)
 	// Returns the pagination behavior of the listManagedInstances Results API method for a given MIG ref
-	GetListManagedInstancesResults(migRef GceRef) (string, error)
+	GetListManagedInstancesResults(ctx context.Context, migRef GceRef) (string, error)
 	// GetMigIsStable returns whether given MIG is stable. A stable state means that: none of the instances in the managed instance group is currently undergoing any type of change (for example, creation, restart, or deletion); no future changes are scheduled for instances in the managed instance group; and the managed instance group itself is not being modified.
-	GetMigIsStable(migRef GceRef) (bool, error)
+	GetMigIsStable(ctx context.Context, migRef GceRef) (bool, error)
 	// RefreshMigInfo updates the cached information for a specific MIG without rebuilding the full zone cache
-	RefreshMigInfo(migRef GceRef) error
+	RefreshMigInfo(ctx context.Context, migRef GceRef) error
 }
 
 type timeProvider interface {
@@ -356,12 +359,7 @@ func (c *cachingMigInfoProvider) GetMigTargetSize(ctx context.Context, migRef Gc
 		return targetSize, nil
 	}
 
-	var err error
-	if c.cache.IsMigTargetSizeCacheEmpty() {
-		// Cache is cold after Refresh() -- list all MIGs and populate the cache.
-		err = c.fillMigInfoCache(ctx)
-	}
-
+	err := c.fillMigInfoCacheIfCold(ctx)
 	targetSize, found = c.cache.GetMigTargetSize(ctx, migRef)
 	if found && err == nil {
 		return targetSize, nil
@@ -369,8 +367,8 @@ func (c *cachingMigInfoProvider) GetMigTargetSize(ctx context.Context, migRef Gc
 
 	// We get here in one of 3 cases:
 	//  * InvalidateMigTargetSize was called for this specific mig, so it's not found in cache
-	//  * fillMigInfoCache returned an error
-	//  * MIG not found
+	//  * fillMigInfoCache returned an error, now or earlier since the cache was last invalidated
+	//  * MIG not found, e.g. because it was deleted or registered after MIGs were listed
 	err = c.fillSingleMigInfo(ctx, migRef)
 	if err != nil {
 		return 0, err
@@ -391,7 +389,7 @@ func (c *cachingMigInfoProvider) GetMigBasename(ctx context.Context, migRef GceR
 		return basename, nil
 	}
 
-	err := c.fillMigInfoCache(ctx)
+	err := c.fillMigInfoCacheIfCold(ctx)
 	basename, found = c.cache.GetMigBasename(migRef)
 	if err == nil && found {
 		return basename, nil
@@ -417,7 +415,7 @@ func (c *cachingMigInfoProvider) GetMigInstanceTemplateName(ctx context.Context,
 		return instanceTemplateName, nil
 	}
 
-	err := c.fillMigInfoCache(ctx)
+	err := c.fillMigInfoCacheIfCold(ctx)
 	instanceTemplateName, found = c.cache.GetMigInstanceTemplateName(ctx, migRef)
 	if err == nil && found {
 		return instanceTemplateName, nil
@@ -477,32 +475,51 @@ func (c *cachingMigInfoProvider) GetMigKubeEnv(ctx context.Context, migRef GceRe
 	return kubeEnv, nil
 }
 
-// filMigInfoCache needs to be called with migInfoMutex locked
+// fillMigInfoCacheIfCold lists all MIGs to populate the MIG info cache, unless it has already been
+// attempted since the cache was last invalidated. It needs to be called with migInfoMutex locked.
+func (c *cachingMigInfoProvider) fillMigInfoCacheIfCold(ctx context.Context) error {
+	if c.cache.IsMigInfoCacheWarm() {
+		return nil
+	}
+	return c.fillMigInfoCache(ctx)
+}
+
+// fillMigInfoCache needs to be called with migInfoMutex locked.
+//
+// It marks the MIG info cache as warm even if listing MIGs fails, so that a failed listing is only
+// retried after the cache is invalidated, rather than for every MIG missing from the cache.
+// Zones whose listing already failed in this loop are not listed again; their
+// cached error is treated as if the listing failed again.
 func (c *cachingMigInfoProvider) fillMigInfoCache(ctx context.Context) error {
+	defer c.cache.MarkMigInfoCacheWarm()
 	logger := klog.FromContext(ctx)
+	allZones := c.listAllZonesWithMigs()
 	var zones []string
-	for zone := range c.listAllZonesWithMigs() {
+	failedZones := map[string]error{}
+	for zone := range allZones {
+		if err := c.cache.GetMigListingError(zone); err != nil {
+			failedZones[zone] = err
+			continue
+		}
 		zones = append(zones, zone)
 	}
 
 	migs := make([][]*gce.InstanceGroupManager, len(zones))
-	errors := make([]error, len(zones))
+	listErrors := make([]error, len(zones))
 	workqueue.ParallelizeUntil(ctx, len(zones), len(zones), func(piece int) {
-		migs[piece], errors[piece] = c.gceClient.FetchAllMigs(zones[piece])
+		migs[piece], listErrors[piece] = c.gceClient.FetchAllMigs(zones[piece])
 	})
 
-	failedZones := map[string]error{}
-	failedZoneCount := 0
-	for idx, err := range errors {
+	for idx, err := range listErrors {
 		if err != nil {
 			logger.Error(err, "Error listing migs from zone", "zone", zones[idx])
 			failedZones[zones[idx]] = err
-			failedZoneCount++
+			c.cache.SetMigListingError(zones[idx], err)
 		}
 	}
 
-	if failedZoneCount > 0 && failedZoneCount == len(zones) {
-		return fmt.Errorf("%v", errors)
+	if len(failedZones) > 0 && len(failedZones) == len(allZones) {
+		return fmt.Errorf("%v", failedZones)
 	}
 
 	registeredMigRefs := c.getRegisteredMigRefs()
@@ -543,11 +560,19 @@ func (c *cachingMigInfoProvider) fillMigInfoCache(ctx context.Context) error {
 }
 
 // RefreshMigInfo updates the cached information for a specific MIG without rebuilding the full zone cache
-func (c *cachingMigInfoProvider) RefreshMigInfo(migRef GceRef) error {
-	return c.fillSingleMigInfo(context.TODO(), migRef)
+func (c *cachingMigInfoProvider) RefreshMigInfo(ctx context.Context, migRef GceRef) error {
+	return c.fillSingleMigInfo(ctx, migRef)
 }
 
 func (c *cachingMigInfoProvider) fillSingleMigInfo(ctx context.Context, migRef GceRef) error {
+	// If listing MIGs in this zone was rate limited in this loop (e.g. read
+	// quota exhausted), fetching the MIG individually would most likely fail
+	// the same way and only consume more quota. Handle the cached error as if
+	// the fetch had failed with it instead of sending the request.
+	if err := c.cache.GetMigListingError(migRef.Zone); isRateLimitError(err) {
+		c.migLister.HandleMigIssue(migRef, err)
+		return err
+	}
 	igm, err := c.gceClient.FetchMig(ctx, migRef)
 	if err != nil {
 		c.migLister.HandleMigIssue(migRef, err)
@@ -555,6 +580,38 @@ func (c *cachingMigInfoProvider) fillSingleMigInfo(ctx context.Context, migRef G
 	}
 	c.setMigInfoCache(ctx, migRef, igm)
 	return nil
+}
+
+// isRateLimitError returns true if err is a GCE API rate limiting error, such
+// as the one returned when the per-minute read requests quota is exhausted:
+//
+//	HTTP 403 {"message": "Quota exceeded for quota metric 'Read requests' and limit 'Read requests per minute per region' ...",
+//	          "errors": [{"domain": "usageLimits", "reason": "rateLimitExceeded", ...}],
+//	          "details": [{"@type": "type.googleapis.com/google.rpc.ErrorInfo", "reason": "RATE_LIMIT_EXCEEDED", ...}]}
+//
+// Rate limits apply to the whole project rather than to a specific resource,
+// so a different request to the same zone will most likely fail too.
+func isRateLimitError(err error) bool {
+	var gErr *googleapi.Error
+	if !errors.As(err, &gErr) {
+		return false
+	}
+	switch gErr.Code {
+	case http.StatusTooManyRequests:
+		return true
+	case http.StatusForbidden:
+		for _, item := range gErr.Errors {
+			if item.Reason == "rateLimitExceeded" || item.Reason == "userRateLimitExceeded" {
+				return true
+			}
+		}
+		for _, detail := range gErr.Details {
+			if info, ok := detail.(map[string]interface{}); ok && info["@type"] == "type.googleapis.com/google.rpc.ErrorInfo" && info["reason"] == "RATE_LIMIT_EXCEEDED" {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func (c *cachingMigInfoProvider) setMigInfoCache(ctx context.Context, migRef GceRef, mig *gce.InstanceGroupManager) {
@@ -575,7 +632,7 @@ func (c *cachingMigInfoProvider) setMigInfoCache(ctx context.Context, migRef Gce
 	c.cache.SetMigInstanceTemplateName(migRef, InstanceTemplateName{templateName, regional})
 }
 
-func (c *cachingMigInfoProvider) GetMigIsStable(migRef GceRef) (bool, error) {
+func (c *cachingMigInfoProvider) GetMigIsStable(ctx context.Context, migRef GceRef) (bool, error) {
 	c.migInfoMutex.Lock()
 	defer c.migInfoMutex.Unlock()
 
@@ -584,13 +641,13 @@ func (c *cachingMigInfoProvider) GetMigIsStable(migRef GceRef) (bool, error) {
 		return isStable, nil
 	}
 
-	err := c.fillMigInfoCache(context.TODO())
+	err := c.fillMigInfoCacheIfCold(ctx)
 	isStable, found = c.cache.GetMigIsStable(migRef)
 	if err == nil && found {
 		return isStable, nil
 	}
 
-	err = c.fillSingleMigInfo(context.TODO(), migRef)
+	err = c.fillSingleMigInfo(ctx, migRef)
 	if err != nil {
 		return false, err
 	}
@@ -657,7 +714,7 @@ func (c *cachingMigInfoProvider) GetMigMachineType(ctx context.Context, migRef G
 	return machine, nil
 }
 
-func (c *cachingMigInfoProvider) GetListManagedInstancesResults(migRef GceRef) (string, error) {
+func (c *cachingMigInfoProvider) GetListManagedInstancesResults(ctx context.Context, migRef GceRef) (string, error) {
 	c.migInfoMutex.Lock()
 	defer c.migInfoMutex.Unlock()
 
@@ -666,13 +723,13 @@ func (c *cachingMigInfoProvider) GetListManagedInstancesResults(migRef GceRef) (
 		return listManagedInstancesResults, nil
 	}
 
-	err := c.fillMigInfoCache(context.TODO())
+	err := c.fillMigInfoCacheIfCold(ctx)
 	listManagedInstancesResults, found = c.cache.GetListManagedInstancesResults(migRef)
 	if err == nil && found {
 		return listManagedInstancesResults, nil
 	}
 
-	err = c.fillSingleMigInfo(context.TODO(), migRef)
+	err = c.fillSingleMigInfo(ctx, migRef)
 	if err != nil {
 		return "", err
 	}
